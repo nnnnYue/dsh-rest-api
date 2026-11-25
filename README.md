@@ -28,8 +28,8 @@ REST API 与官方 WebUI 运行在**同一个 dsh 进程、同一份数据**：R
 | | 自定义 OpenAI 兼容 provider 增删改查（写入 settings，热生效，与 WebUI 设置页同步） |
 | | API Key 凭证管理（`POST /credentials`，只回掩码） |
 | **项目** `/projects` | 目录注册（按 canonical path 幂等）、改名、删除、会话台账 |
-| **会话** `/projects/:id/sessions` | 创建会话（cwd 随项目目录）、列表、状态、改名 |
-| | `POST /sessions/:id/messages` 异步发送（202）或 `wait=true` 同步等待 turn 结束 |
+| **会话** `/projects/:id/sessions` | 创建会话（cwd 随项目目录，可同时指定模型与思考等级）、列表、状态、改名 |
+| | `POST /sessions/:id/messages` 异步发送（202）或 `wait=true` 同步等待 turn 结束；可携带 provider/model/reasoningEffort 先行切换会话模型 |
 | | 消息文本支持 `/skill-name args` 调用会话可见的 user-invocable skill |
 | | `POST /sessions/:id/cancel` 停止、`DELETE` 归档 |
 | | `POST /sessions/:id/open` 把会话推到在线 WebUI 前台 |
@@ -91,7 +91,7 @@ curl -sX POST $B/projects -H 'content-type: application/json' \
   -d '{"path": "/repo/my-project", "title": "My Project"}'
 PID=<project id>
 
-# 2. 创建会话（该目录即会话 cwd）
+# 2. 创建会话（该目录即会话 cwd；可选 provider / model / reasoningEffort 指定模型与思考等级）
 curl -sX POST $B/projects/$PID/sessions -H 'content-type: application/json' \
   -d '{"title": "REST session"}'
 SID=<session id>
@@ -175,6 +175,30 @@ curl -sX PUT $B/models/default -H 'content-type: application/json' \
   -d '{"provider": "my-gateway", "model": "my-model"}'
 ```
 
+### 会话级模型与思考等级
+
+会话的模型与思考等级是会话私有状态，下列入口**都不会改动全局默认模型**（`PUT /models/default` 除外）：
+
+```sh
+# 创建时指定（先校验后建会话，校验失败不会留下空会话）
+curl -sX POST $B/projects/$PID/sessions -H 'content-type: application/json' \
+  -d '{"model": "deepseek-v4-pro", "reasoningEffort": "max"}'
+
+# 单独改思考等级（模型不变），或改模型（provider 省略时自动推断，多条线路同名则 400）
+curl -sX PATCH $B/sessions/$SID -H 'content-type: application/json' -d '{"reasoningEffort": "low"}'
+curl -sX PATCH $B/sessions/$SID -H 'content-type: application/json' \
+  -d '{"provider": "deepseek-official", "model": "deepseek-flash"}'
+
+# 读回该会话下一次模型步进将使用的选择
+curl -s $B/sessions/$SID
+```
+
+- 字段形状与 dsh 一致：`{provider, model, reasoningEffort?}`；省略的字段继承会话当前值，新建会话即全局默认。
+- 生效时机为下一次模型步进，运行中的会话可随时切换；`POST /sessions/:id/messages` 也可携带这三个字段先行切换。
+- `GET /models` 为每个模型返回适配器声明的 `reasoning.efforts` 与 `defaultEffort`（DeepSeek 线路为 `off | low | high | max`）。
+- 校验失败返回 400：`model/not-found`（线路/模型不在目录）、`model/ambiguous`（多个 provider 提供同名模型，需带 provider）、`model/reasoning-effort-unsupported`（消息中列出该模型支持的档位）。
+- 只改 `reasoningEffort` 会把当时的默认模型一并固定到该会话（dsh 的模型选择是完整三元组）。
+
 ### 技能管理
 
 ```sh
@@ -231,6 +255,7 @@ GET/PATCH/DELETE /rest/v1/skills/:name[?cwd=]
 - 审批暴露为对 `approval/request` 瀑布事件的进程内 answerer：claim 后挂起等待 REST 应答；id 为插件自签（瀑布事件不带服务 id），审计仍由 harness 的 `approval/asked` / `approval/decided` durable 事件成对落盘。
 - 消息投影（`GET /sessions/:id/messages`）是对 durable 事件的纯折叠：`tool/call` 无配对 `tool/result` 即 `running`，`tool/result.isError` / 事件级 `error` 即 `error`。
 - 会话文件为单写者模型，插件只经官方 API 操作会话，绝不直接打开 JSONL / Zstd 日志。
+- 会话级模型选择走 `resolveAgent` + `agent.model.select()`（与宿主 ACP 传输同一条路径）：先经 `llm.listModels` / `llm.resolveCallConfig` 校验，再向会话日志追加 `model/selection`；不调用 `sessionController.selectModel`，因为它会把全局默认模型一并改掉。
 - "打开会话"推送不经 `ctx.remote.$on` 转发事件（转发源全 Host 仅 `dsh-api-remotes` 可注册一个），而是插件自持 SRC Remote 流服务 `restApi/open-requests`：服务端经 Typert Gateway 的 SRC 反射自动暴露，WebUI 客户端模块手工挂载流 contribution 后订阅。
 
 ## 已知限制

@@ -28,8 +28,8 @@ The REST API runs in the **same dsh process and on the same data** as the offici
 | | CRUD for custom OpenAI-compatible providers (written to settings, hot-reloaded, synced with the WebUI settings page) |
 | | API key credential management (`POST /credentials`, responses are masked) |
 | **Projects** `/projects` | Directory registration (idempotent by canonical path), rename, delete, session ledger |
-| **Sessions** `/projects/:id/sessions` | Create (cwd = project directory), list, status, rename |
-| | `POST /sessions/:id/messages` async send (202) or `wait=true` to block until the turn ends |
+| **Sessions** `/projects/:id/sessions` | Create (cwd = project directory, optionally pinning model and reasoning effort), list, status, rename |
+| | `POST /sessions/:id/messages` async send (202) or `wait=true` to block until the turn ends; carries optional provider/model/reasoningEffort to switch the session model first |
 | | Message text accepts `/skill-name args` to invoke user-invocable skills visible to the session |
 | | `POST /sessions/:id/cancel` to stop, `DELETE` to archive |
 | | `POST /sessions/:id/open` pushes the session to the foreground of online WebUI tabs |
@@ -91,7 +91,7 @@ curl -sX POST $B/projects -H 'content-type: application/json' \
   -d '{"path": "/repo/my-project", "title": "My Project"}'
 PID=<project id>
 
-# 2. Create a session (the project directory becomes the session cwd)
+# 2. Create a session (the project directory becomes the session cwd; optional provider / model / reasoningEffort pin its model and thinking level)
 curl -sX POST $B/projects/$PID/sessions -H 'content-type: application/json' \
   -d '{"title": "REST session"}'
 SID=<session id>
@@ -175,6 +175,32 @@ curl -sX PUT $B/models/default -H 'content-type: application/json' \
   -d '{"provider": "my-gateway", "model": "my-model"}'
 ```
 
+### Session-scoped model and reasoning effort
+
+A session's model and thinking level are session-private state; none of the entries below touch the global default model (only `PUT /models/default` does):
+
+```sh
+# Pin at creation time (validated before the session is created; a rejected
+# selection leaves no empty session behind)
+curl -sX POST $B/projects/$PID/sessions -H 'content-type: application/json' \
+  -d '{"model": "deepseek-v4-pro", "reasoningEffort": "max"}'
+
+# Change only the effort (model unchanged), or change the model (provider is
+# inferred when omitted; ambiguous across providers -> 400)
+curl -sX PATCH $B/sessions/$SID -H 'content-type: application/json' -d '{"reasoningEffort": "low"}'
+curl -sX PATCH $B/sessions/$SID -H 'content-type: application/json' \
+  -d '{"provider": "deepseek-official", "model": "deepseek-flash"}'
+
+# Read back the selection the session's next model step will use
+curl -s $B/sessions/$SID
+```
+
+- Field shape matches dsh: `{provider, model, reasoningEffort?}`; omitted fields inherit the session's current selection, which starts as the global default.
+- Changes apply from the next model step; a running session can be switched at any time. `POST /sessions/:id/messages` also accepts the three fields to switch first.
+- `GET /models` reports each model's adapter-declared `reasoning.efforts` and `defaultEffort` (DeepSeek routes: `off | low | high | max`).
+- Validation failures return 400: `model/not-found` (route/model missing from the catalog), `model/ambiguous` (several providers offer the same model id; pass provider), `model/reasoning-effort-unsupported` (the message lists the supported efforts).
+- An effort-only change also pins the then-current default model onto the session (a dsh model selection is always the complete triple).
+
 ### Skill management
 
 ```sh
@@ -231,6 +257,7 @@ GET/PATCH/DELETE /rest/v1/skills/:name[?cwd=]
 - Approvals are exposed as an in-process answerer for `approval/request` waterfall events: claimed, then held until a REST response arrives; ids are plugin-signed (waterfall events carry no service id), while auditing still lands as paired durable `approval/asked` / `approval/decided` events.
 - The message projection (`GET /sessions/:id/messages`) is a pure fold over durable events: a `tool/call` with no matching `tool/result` is `running`; `tool/result.isError` or an event-level `error` is `error`.
 - Session files follow a single-writer model: the plugin only touches sessions through official APIs and never opens JSONL / Zstd logs directly.
+- Session-scoped model selection goes through `resolveAgent` + `agent.model.select()` (the same path the host's ACP transport takes): validate via `llm.listModels` / `llm.resolveCallConfig`, then append a `model/selection` event to the session log. `sessionController.selectModel` is deliberately avoided because it also overwrites the global default model.
 - The "open session" push does not forward events via `ctx.remote.$on` (only one forward source per Host, owned by `dsh-api-remotes`); instead the plugin serves its own SRC Remote stream `restApi/open-requests`, auto-exposed server-side via Typert Gateway SRC reflection and subscribed manually by the WebUI client module's stream contribution.
 
 ## Known limitations

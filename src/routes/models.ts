@@ -71,7 +71,18 @@ export function modelRoutes(deps: Deps): RouteSpec[] {
         const providers = llm.listProviders()
         const items = []
         for (const provider of providers) {
-          items.push({ ...provider, models: await llm.listModels(provider.id) })
+          const models = await llm.listModels(provider.id)
+          items.push({
+            ...provider,
+            models: await Promise.all(models.map(async (model) => {
+              try {
+                const info = await llm.resolveModelInfo(provider.id, model.id, NEVER_ABORT)
+                return info.reasoning === undefined ? model : { ...model, reasoning: info.reasoning }
+              } catch {
+                return model
+              }
+            })),
+          })
         }
         let fallback
         try {

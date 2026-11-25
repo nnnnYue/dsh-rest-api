@@ -20,7 +20,7 @@ export function openapiDocument(config: RestApiConfig): Record<string, unknown> 
         get: { summary: 'This document', operationId: 'openapi', responses: { '200': { description: 'OK' } } },
       },
       '/models': {
-        get: { summary: 'List live provider routes and their models', operationId: 'listModels', responses: { '200': { description: 'OK' }, '401': ref('') } },
+        get: { summary: 'List live provider routes and their models (each with its adapter-declared reasoning efforts when available)', operationId: 'listModels', responses: { '200': { description: 'OK' }, '401': ref('') } },
       },
       '/models/default': {
         get: { summary: 'Current default model selection', operationId: 'getDefaultModel', responses: { '200': { description: 'OK' } } },
@@ -93,19 +93,25 @@ export function openapiDocument(config: RestApiConfig): Record<string, unknown> 
       '/projects/{id}/sessions': {
         get: { summary: 'Sessions of a project, ordered as in the WebUI', operationId: 'listProjectSessions', parameters: [idParam], responses: { '200': { description: 'OK' }, '404': ref('') } },
         post: {
-          summary: 'Create a session inside a project',
+          summary: 'Create a session inside a project, optionally pinning its model and reasoning effort',
           operationId: 'createSession',
           parameters: [idParam],
-          requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { sessionId: { type: 'string', description: 'Adopt a named blank session' }, agentPreset: { type: 'string' }, title: { type: 'string' } } } } } },
-          responses: { '201': { description: 'Created' }, '404': ref('') },
+          requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { sessionId: { type: 'string', description: 'Adopt a named blank session' }, agentPreset: { type: 'string' }, title: { type: 'string' }, provider: { type: 'string', description: 'Provider route for body.model; inferred when omitted and unambiguous' }, model: { type: 'string', description: 'Model for this session; defaults are inherited when omitted' }, reasoningEffort: { type: 'string', description: 'Adapter-declared effort (e.g. off | low | high | max); omitted fields inherit the session current selection' } } } } } },
+          responses: { '201': { description: 'Created (body.model carries the effective selection)' }, '400': ref(''), '404': ref('') },
         },
       },
       '/sessions': {
         get: { summary: 'All visible sessions with project association', operationId: 'listSessions', responses: { '200': { description: 'OK' } } },
       },
       '/sessions/{id}': {
-        get: { summary: 'Session state (title, running, queue, pending input)', operationId: 'getSession', parameters: [idParam], responses: { '200': { description: 'OK' }, '404': ref('') } },
-        patch: { summary: 'Rename a session', operationId: 'renameSession', parameters: [idParam], requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['title'], properties: { title: { type: 'string' } } } } } }, responses: { '200': { description: 'OK' }, '400': ref(''), '404': ref('') } },
+        get: { summary: 'Session state (title, model selection, running, queue, pending input)', operationId: 'getSession', parameters: [idParam], responses: { '200': { description: 'OK' }, '404': ref('') } },
+        patch: {
+          summary: 'Rename a session and/or set its model selection (omitted fields inherit the session current values; never touches the global default)',
+          operationId: 'updateSession',
+          parameters: [idParam],
+          requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { title: { type: 'string' }, provider: { type: 'string' }, model: { type: 'string' }, reasoningEffort: { type: 'string', description: 'Adapter-declared effort (e.g. off | low | high | max)' } } } } } },
+          responses: { '200': { description: 'OK (echoes only the changed fields)' }, '400': ref(''), '404': ref('') },
+        },
         delete: {
           summary: 'Archive a session (query stopActivity=true to stop running work first)',
           operationId: 'archiveSession',
@@ -137,11 +143,12 @@ export function openapiDocument(config: RestApiConfig): Record<string, unknown> 
             mode: { type: 'string', enum: ['queue', 'steer'], default: 'queue' },
             wait: { type: 'boolean', default: false },
             timeoutMs: { type: 'integer', description: 'Only with wait=true; default 120000' },
-            model: { type: 'string', description: 'Switch this session\'s model first' },
-            reasoningEffort: { type: 'string' },
+            provider: { type: 'string', description: 'Provider route for body.model; inferred when omitted and unambiguous' },
+            model: { type: 'string', description: 'Set this session model first (session-local; the global default is untouched)' },
+            reasoningEffort: { type: 'string', description: 'Set this session reasoning effort first (adapter-declared, e.g. off | low | high | max)' },
             clientTimeZone: { type: 'string' },
           } } } } },
-          responses: { '202': { description: 'Accepted (async)' }, '200': { description: 'Turn settled (wait=true)' }, '409': ref('') },
+          responses: { '202': { description: 'Accepted (async)' }, '200': { description: 'Turn settled (wait=true)' }, '400': ref(''), '409': ref('') },
         },
       },
       '/sessions/{id}/cancel': {

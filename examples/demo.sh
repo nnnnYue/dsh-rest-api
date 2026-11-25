@@ -45,6 +45,22 @@ curl -s "${AUTH[@]+${AUTH[@]}}" "$BASE/sessions/$SID/skills" | head -c 300; echo
 echo "=== 7. models catalog ==="
 curl -s "${AUTH[@]+${AUTH[@]}}" "$BASE/models" | head -c 300; echo
 
+echo "=== 7b. session-scoped model selection ==="
+DEFAULT=$(curl -s "${AUTH[@]+${AUTH[@]}}" "$BASE/models/default")
+PROVIDER=$(echo "$DEFAULT" | jqv ".selection.provider")
+MODEL=$(echo "$DEFAULT" | jqv ".selection.model")
+echo "default route: $PROVIDER / $MODEL"
+# create a second session pinned to that route and effort
+S2=$(curl -s "${AUTH[@]+${AUTH[@]}}" -X POST "$BASE/projects/$PID/sessions" \
+  -H 'content-type: application/json' \
+  -d "{\"provider\": \"$PROVIDER\", \"model\": \"$MODEL\", \"reasoningEffort\": \"max\"}")
+echo "$S2"
+SID2=$(echo "$S2" | jqv ".sessionId")
+# effort-only patch, then read back the effective selection
+curl -s "${AUTH[@]+${AUTH[@]}}" -X PATCH "$BASE/sessions/$SID2" \
+  -H 'content-type: application/json' -d '{"reasoningEffort": "low"}'; echo
+curl -s "${AUTH[@]+${AUTH[@]}}" "$BASE/sessions/$SID2" | jqv ".model"; echo
+
 echo "=== 8. cancel anything running ==="
 curl -s "${AUTH[@]+${AUTH[@]}}" -X POST "$BASE/sessions/$SID/cancel"; echo
 
@@ -69,8 +85,9 @@ curl -s "${AUTH[@]+${AUTH[@]}}" -X POST "$BASE/sessions/$SID/open"; echo
 curl -s "${AUTH[@]+${AUTH[@]}}" -X POST "$BASE/sessions/00000000-0000-0000-0000-000000000000/open" \
   -o /dev/null -w 'unknown session -> HTTP %{http_code}\n'
 
-echo "=== cleanup: archive session + unregister project ==="
+echo "=== cleanup: archive sessions + unregister project ==="
 curl -s "${AUTH[@]+${AUTH[@]}}" -X DELETE "$BASE/sessions/$SID"; echo
+curl -s "${AUTH[@]+${AUTH[@]}}" -X DELETE "$BASE/sessions/$SID2"; echo
 curl -s "${AUTH[@]+${AUTH[@]}}" -X DELETE "$BASE/projects/$PID"; echo
 rm -rf "$DEMO_DIR"
 

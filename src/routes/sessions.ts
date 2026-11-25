@@ -3,7 +3,16 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { RouteSpec } from '../http.ts'
 import { HttpError, json } from '../errors.ts'
 import { NEVER_ABORT, assistantText, sessionTitle, sessionTitles } from '../util.ts'
-import { asReasoningEffort, asSessionId, asSessionRequestId, asWorkspaceId } from '../brand.ts'
+import { asSessionId, asSessionRequestId, asWorkspaceId } from '../brand.ts'
+import {
+  defaultSelection,
+  modelSelectionInput,
+  recordSessionModel,
+  resolveModelSelection,
+  selectSessionModel,
+  sessionModelSelection,
+  type ResolvedSelection,
+} from '../model-selection.ts'
 import { SseWriter, type EventHub } from '../sse.ts'
 import { projectMessages } from '../projection.ts'
 import type { Deps } from '../types.ts'
@@ -172,7 +181,8 @@ export function sessionRoutes(deps: Deps, hub: EventHub): RouteSpec[] {
       async handler(_req, res, params) {
         const state = await sessionController.state({ sessionId: asSessionId(params.id!) }, NEVER_ABORT)
         const archived = workspaceRegistry.archivedSessionIds.includes(asSessionId(params.id!))
-        json(res, 200, { sessionId: params.id, title: await sessionTitle(sessionController, params.id!), ...state, archived })
+        const model = await sessionModelSelection(deps, params.id!)
+        json(res, 200, { sessionId: params.id, title: await sessionTitle(sessionController, params.id!), ...state, archived, model: model ?? null })
       },
     },
     {
@@ -180,11 +190,22 @@ export function sessionRoutes(deps: Deps, hub: EventHub): RouteSpec[] {
       path: '/sessions/:id',
       async handler(_req, res, params, body) {
         const { title } = (body ?? {}) as { title?: unknown }
-        if (typeof title !== 'string' || title.length === 0) {
-          throw new HttpError(400, 'gateway/bad-request', 'body.title (non-empty string) is required')
+        if (title !== undefined && (typeof title !== 'string' || title.length === 0)) {
+          throw new HttpError(400, 'gateway/bad-request', 'body.title must be a non-empty string')
         }
-        const value = await sessionController.rename({ sessionId: asSessionId(params.id!), title })
-        json(res, 200, { sessionId: params.id, title: value.title, seq: value.seq })
+        const model = modelSelectionInput(body)
+        if (title === undefined && model === undefined) {
+          throw new HttpError(400, 'gateway/bad-request', 'body.title or body.{provider, model, reasoningEffort} is required')
+        }
+        const selected = model !== undefined ? await selectSessionModel(deps, params.id!, model) : undefined
+        const renamed = typeof title === 'string'
+          ? await sessionController.rename({ sessionId: asSessionId(params.id!), title })
+          : undefined
+        json(res, 200, {
+          sessionId: params.id,
+          ...(renamed !== undefined ? { title: renamed.title, seq: renamed.seq } : {}),
+          ...(selected !== undefined ? { model: selected } : {}),
+        })
       },
     },
     {
@@ -249,15 +270,31 @@ export function sessionRoutes(deps: Deps, hub: EventHub): RouteSpec[] {
           agentPreset?: unknown
           title?: unknown
         }
+        const model = modelSelectionInput(body)
+        // Validate before create so a rejected selection leaves no empty session behind.
+        let selected: ResolvedSelection | undefined
+        if (model !== undefined) {
+          const base = typeof named === 'string'
+            ? await sessionModelSelection(deps, named).catch(() => undefined)
+            : defaultSelection(deps)
+          selected = await resolveModelSelection(deps.llm, model, base)
+        }
         const created = await sessionController.create({
           workspaceId: asWorkspaceId(workspace.id),
           ...(typeof named === 'string' ? { sessionId: asSessionId(named) } : {}),
           ...(typeof agentPreset === 'string' ? { agentPreset } : {}),
         })
+        if (selected !== undefined) await recordSessionModel(deps, created.sessionId, selected)
         if (typeof title === 'string' && title.length > 0) {
           await sessionController.rename({ sessionId: asSessionId(created.sessionId), title })
         }
-        json(res, 201, { sessionId: created.sessionId, agentPreset: created.agentPreset, projectId: workspace.id })
+        const effective = selected ?? await sessionModelSelection(deps, created.sessionId)
+        json(res, 201, {
+          sessionId: created.sessionId,
+          agentPreset: created.agentPreset,
+          projectId: workspace.id,
+          model: effective ?? null,
+        })
       },
     },
     {
@@ -265,29 +302,21 @@ export function sessionRoutes(deps: Deps, hub: EventHub): RouteSpec[] {
       path: '/sessions/:id/messages',
       async handler(_req, res, params, body) {
         const sessionId = params.id!
-        const { text, mode, wait, timeoutMs, model, reasoningEffort, clientTimeZone } = (body ?? {}) as {
+        const { text, mode, wait, timeoutMs, clientTimeZone } = (body ?? {}) as {
           text?: unknown
           mode?: unknown
           wait?: unknown
           timeoutMs?: unknown
-          model?: unknown
-          reasoningEffort?: unknown
           clientTimeZone?: unknown
         }
+        const model = modelSelectionInput(body)
         if (typeof text !== 'string' || text.length === 0) {
           throw new HttpError(400, 'gateway/bad-request', 'body.text (non-empty string) is required; "/skill-name args" invokes a user-invocable skill')
         }
         if (mode !== undefined && mode !== 'queue' && mode !== 'steer') {
           throw new HttpError(400, 'gateway/bad-request', 'body.mode must be "queue" or "steer"')
         }
-        if (typeof model === 'string') {
-          await sessionController.selectModel({
-            sessionId: asSessionId(sessionId),
-            provider: model,
-            model,
-            ...(typeof reasoningEffort === 'string' ? { reasoningEffort: asReasoningEffort(reasoningEffort) } : {}),
-          })
-        }
+        if (model !== undefined) await selectSessionModel(deps, sessionId, model)
         const requestId = randomUUID()
         await sessionController.prompt({
           requestId: asSessionRequestId(requestId),
