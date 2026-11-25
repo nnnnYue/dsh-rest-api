@@ -1,0 +1,10 @@
+# Development overlay: run `npx @deepseek-ai/dsh@next web --patch ./dev.patch.yml`
+# from this repo's root. Points the loader at the repo's built plugin via the
+# current working directory, so no profile installation is needed while iterating.
+- insert:
+    - id: rest-api
+      name: !!js process.cwd() + '/lib/index.js'
+      config:
+        # loopback-only until a Bearer token is set here (or via !!js env interpolation)
+        apiKey: null
+        prefix: /rest/v1

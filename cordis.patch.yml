@@ -1,0 +1,12 @@
+# Patch layer contributed by the dsh-rest-api bundle.
+# Mounts the REST API plugin into the web profile's web server.
+- insert:
+    - id: rest-api
+      name: dsh-rest-api
+      config:
+        # Bearer token required on /rest/v1/* requests.
+        # Recommended: set via env in the parent cordis.yml / patch with !!js interpolation,
+        # e.g. apiKey: !!js process.env.DSH_REST_API_KEY
+        apiKey: null
+        # Route prefix for the REST surface.
+        prefix: /rest/v1

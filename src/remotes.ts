@@ -1,0 +1,98 @@
+/** Host-side push channel that hands REST-issued open-session requests to WebUI clients. */
+
+import type { Context } from '@deepseek-ai/cordis'
+import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+
+/** One live push frame consumed by the plugin's WebUI client module. */
+export interface OpenSessionFrame {
+  readonly type: 'open-session'
+  readonly sessionId: string
+  readonly requestId: string
+  readonly time: number
+}
+
+/**
+ * SRC-mode Remote service exposing the `restApi/open-requests` stream. The
+ * plugin's WebUI client module (`lib/client.js`) mounts a zero-parameter
+ * contribution for this endpoint and calls `uiWorkspace.openSession` for every
+ * frame. Delivery is live-only: frames are never buffered for tabs that are
+ * not currently subscribed, so REST callers see `delivered` reflect the
+ * subscription count at push time.
+ */
+export class RestApiRemotes extends TypertRemoteService {
+  private readonly streams = new Set<FrameQueue<OpenSessionFrame>>()
+
+  /** @param ctx - Host context; the Gateway discovers this service by SRC reflection. */
+  constructor(ctx: Context) {
+    super(ctx, 'restApiRemotes', { namespace: 'restApi' })
+  }
+
+  /**
+   * Open one generation of the live open-request feed.
+   * @param signal - Remote stream cancellation.
+   * @returns every REST-issued open-session request from subscription time on.
+   */
+  @Remote({ mode: 'stream' })
+  async *openRequests(signal: AbortSignal): AsyncIterable<OpenSessionFrame> {
+    signal.throwIfAborted()
+    const queue = new FrameQueue<OpenSessionFrame>()
+    this.streams.add(queue)
+    try {
+      yield* queue.iterate(signal)
+    } finally {
+      this.streams.delete(queue)
+      queue.end()
+    }
+  }
+
+  /**
+   * Push one frame to every subscribed client.
+   * @returns the subscriber count the frame reached (0 = no WebUI tab is listening).
+   */
+  broadcast(frame: OpenSessionFrame): number {
+    for (const queue of this.streams) queue.push(frame)
+    return this.streams.size
+  }
+}
+
+/** Unbounded buffer between one REST caller and one live stream consumer. */
+class FrameQueue<T> {
+  private readonly buffer: T[] = []
+  private wake: (() => void) | undefined
+  private done = false
+
+  push(frame: T): void {
+    if (this.done) return
+    this.buffer.push(frame)
+    const wake = this.wake
+    this.wake = undefined
+    wake?.()
+  }
+
+  end(): void {
+    if (this.done) return
+    this.done = true
+    const wake = this.wake
+    this.wake = undefined
+    wake?.()
+  }
+
+  async *iterate(signal: AbortSignal): AsyncIterable<T> {
+    const onAbort = (): void => { this.end() }
+    signal.addEventListener('abort', onAbort, { once: true })
+    try {
+      while (!this.done && !signal.aborted) {
+        const frame = this.buffer.shift()
+        if (frame !== undefined) {
+          yield frame
+          continue
+        }
+        await new Promise<void>((resolve) => { this.wake = resolve })
+      }
+      while (!signal.aborted && this.buffer.length > 0) yield this.buffer.shift() as T
+    } finally {
+      signal.removeEventListener('abort', onAbort)
+      this.end()
+    }
+  }
+}

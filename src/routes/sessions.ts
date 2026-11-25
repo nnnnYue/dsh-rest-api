@@ -1,0 +1,364 @@
+import { randomUUID } from 'node:crypto'
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { RouteSpec } from '../http.ts'
+import { HttpError, json } from '../errors.ts'
+import { NEVER_ABORT, assistantText, sessionTitle, sessionTitles } from '../util.ts'
+import { asReasoningEffort, asSessionId, asSessionRequestId, asWorkspaceId } from '../brand.ts'
+import { SseWriter, type EventHub } from '../sse.ts'
+import { projectMessages } from '../projection.ts'
+import type { Deps } from '../types.ts'
+
+const REPLAY_PAGE_MESSAGES = 400
+const REPLAY_MAX_PAGES = 200
+const DEFAULT_EVENT_LIMIT = 1000
+const MAX_EVENT_LIMIT = 10_000
+
+interface WireEvent {
+  readonly type: string
+  readonly seq: number
+  readonly time: number
+  readonly data: unknown
+  readonly ignorable?: true
+  readonly surfaceOp?: unknown
+}
+
+/**
+ * Sessions are driven exclusively through `sessionController` so every
+ * mutation lands in the same live store the WebUI observes — REST-created
+ * sessions, prompts, and cancellations appear there in real time.
+ */
+export function sessionRoutes(deps: Deps, hub: EventHub): RouteSpec[] {
+  const { sessionController, workspaceRegistry } = deps
+
+  /** Summaries keyed for project lookups; includes global archived flags. */
+  async function sessionIndex(): Promise<{
+    byId: Map<string, { sessionId: string; running: boolean; blank: boolean; updatedAt: number; cwd?: string; parentSessionId?: string; origin?: string }>
+    archived: Set<string>
+    workspaceOf: Map<string, string>
+  }> {
+    const { items } = await sessionController.list({}, NEVER_ABORT)
+    const archived = new Set(workspaceRegistry.archivedSessionIds)
+    const workspaceOf = new Map<string, string>()
+    for (const workspace of workspaceRegistry.list()) {
+      for (const sessionId of workspace.sessionIds) workspaceOf.set(sessionId, workspace.id)
+    }
+    const byId = new Map(items.map((item) => [item.sessionId, item]))
+    return { byId, archived, workspaceOf }
+  }
+
+  function assertFound(sessionId: string, index: { byId: Map<string, unknown> }): void {
+    if (!index.byId.has(sessionId)) {
+      throw new HttpError(404, 'session/not-found', `session "${sessionId}" not found`)
+    }
+  }
+  void assertFound
+
+  /** Backwards-paged history collection down to `afterSeq` (inclusive cut). */
+  async function collectEvents(sessionId: string, afterSeq: number | undefined, limit: number): Promise<{ events: WireEvent[]; hasMore: boolean }> {
+    const state = await sessionController.state({ sessionId: asSessionId(sessionId) }, NEVER_ABORT)
+    const collected: WireEvent[] = []
+    let before: number | undefined
+    let hasMore = false
+    for (let page = 0; page < REPLAY_MAX_PAGES; page++) {
+      const result = await sessionController.events({
+        address: { kind: 'session', sessionId: asSessionId(sessionId) },
+        throughSeq: state.cursor,
+        ...(before !== undefined ? { beforeSeq: before } : {}),
+        maxMessages: REPLAY_PAGE_MESSAGES,
+      }, NEVER_ABORT)
+      const events = result.records.map((record) => record.event as WireEvent)
+      collected.push(...events)
+      hasMore = result.hasMore
+      if (!result.hasMore || events.length === 0) break
+      const minSeq = Math.min(...events.map((event) => event.seq))
+      if (afterSeq !== undefined && minSeq <= afterSeq + 1) break
+      if (collected.length >= limit) break
+      before = minSeq
+    }
+    const events = collected
+      .filter((event) => afterSeq === undefined || event.seq > afterSeq)
+      .sort((a, b) => a.seq - b.seq)
+      .slice(0, limit)
+    return { events, hasMore: hasMore && events.length >= limit }
+  }
+
+  /** SSE bridge: replay from the log, then forward live durable + delta frames. */
+  async function streamSession(req: IncomingMessage, res: ServerResponse, sessionId: string, afterSeq: number | undefined, deltas: boolean): Promise<void> {
+    const sse = new SseWriter(res)
+    sse.hello()
+
+    let draining = true
+    let lastReplayedSeq = afterSeq ?? 0
+    const buffered: WireEvent[] = []
+    const bufferedDeltas: unknown[] = []
+
+    // Subscribe before replay so nothing can slip through the gap; while
+    // draining, live frames buffer, after which the same listeners stream
+    // directly — no resubscription window.
+    const unsubscribeSession = hub.subscribeSession(sessionId, (event) => {
+      const wire = event as WireEvent
+      if (draining) {
+        buffered.push(wire)
+        return
+      }
+      if (wire.seq <= lastReplayedSeq) return
+      sse.send('session', String(wire.seq), wire)
+      lastReplayedSeq = wire.seq
+    })
+    const unsubscribeDeltas = deltas
+      ? hub.subscribeDeltas(sessionId, (frame) => {
+          if (draining) bufferedDeltas.push(frame)
+          else sse.send('delta', null, frame)
+        })
+      : () => {}
+
+    let finished = false
+    const finish = (endFrame?: unknown) => {
+      if (finished) return
+      finished = true
+      unsubscribeSession()
+      unsubscribeDeltas()
+      if (endFrame !== undefined) sse.send('end', null, endFrame)
+      sse.close()
+    }
+    req.on('close', () => finish())
+
+    try {
+      const { events } = await collectEvents(sessionId, afterSeq, MAX_EVENT_LIMIT)
+      for (const event of events) {
+        if (sse.closed || finished) return
+        sse.send('session', String(event.seq), event)
+        lastReplayedSeq = event.seq
+      }
+    } catch (error: unknown) {
+      finish({ error: error instanceof Error ? error.message : String(error) })
+      return
+    }
+
+    // Transition to live: flush deltas first (transient, ordered), then any
+    // durable events buffered during replay above the watermark.
+    for (const frame of bufferedDeltas.splice(0, bufferedDeltas.length)) {
+      sse.send('delta', null, frame)
+    }
+    for (const wire of buffered.splice(0, buffered.length)) {
+      if (wire.seq > lastReplayedSeq) {
+        sse.send('session', String(wire.seq), wire)
+        lastReplayedSeq = wire.seq
+      }
+    }
+    draining = false
+  }
+
+  return [
+    {
+      method: 'GET',
+      path: '/sessions',
+      async handler(_req, res) {
+        const { byId, archived, workspaceOf } = await sessionIndex()
+        const rows = [...byId.values()].map((item) => ({
+          ...item,
+          archived: archived.has(item.sessionId),
+          projectId: workspaceOf.get(item.sessionId),
+        }))
+        const titles = await sessionTitles(sessionController, rows.map((row) => row.sessionId))
+        json(res, 200, {
+          items: rows.map((row) => ({ ...row, title: titles.get(row.sessionId) ?? null })),
+        })
+      },
+    },
+    {
+      method: 'GET',
+      path: '/sessions/:id',
+      async handler(_req, res, params) {
+        const state = await sessionController.state({ sessionId: asSessionId(params.id!) }, NEVER_ABORT)
+        const archived = workspaceRegistry.archivedSessionIds.includes(asSessionId(params.id!))
+        json(res, 200, { sessionId: params.id, title: await sessionTitle(sessionController, params.id!), ...state, archived })
+      },
+    },
+    {
+      method: 'PATCH',
+      path: '/sessions/:id',
+      async handler(_req, res, params, body) {
+        const { title } = (body ?? {}) as { title?: unknown }
+        if (typeof title !== 'string' || title.length === 0) {
+          throw new HttpError(400, 'gateway/bad-request', 'body.title (non-empty string) is required')
+        }
+        const value = await sessionController.rename({ sessionId: asSessionId(params.id!), title })
+        json(res, 200, { sessionId: params.id, title: value.title, seq: value.seq })
+      },
+    },
+    {
+      method: 'GET',
+      path: '/sessions/:id/events',
+      async handler(_req, res, params, _body, query) {
+        const afterRaw = query.get('afterSeq')
+        const afterSeq = afterRaw === null || afterRaw === '' ? undefined : Number(afterRaw)
+        if (afterSeq !== undefined && (!Number.isInteger(afterSeq) || afterSeq < 0)) {
+          throw new HttpError(400, 'gateway/bad-request', 'query.afterSeq must be a non-negative integer')
+        }
+        const limitRaw = query.get('limit')
+        const limit = limitRaw === null || limitRaw === '' ? DEFAULT_EVENT_LIMIT : Number(limitRaw)
+        if (!Number.isInteger(limit) || limit < 1 || limit > MAX_EVENT_LIMIT) {
+          throw new HttpError(400, 'gateway/bad-request', `query.limit must be an integer in [1, ${MAX_EVENT_LIMIT}]`)
+        }
+        const { events, hasMore } = await collectEvents(params.id!, afterSeq, limit)
+        json(res, 200, { sessionId: params.id, events, hasMore })
+      },
+    },
+    {
+      method: 'GET',
+      path: '/sessions/:id/messages',
+      async handler(_req, res, params, _body, query) {
+        const afterRaw = query.get('afterSeq')
+        const afterSeq = afterRaw === null || afterRaw === '' ? undefined : Number(afterRaw)
+        if (afterSeq !== undefined && (!Number.isInteger(afterSeq) || afterSeq < 0)) {
+          throw new HttpError(400, 'gateway/bad-request', 'query.afterSeq must be a non-negative integer')
+        }
+        const { events, hasMore } = await collectEvents(params.id!, afterSeq, MAX_EVENT_LIMIT)
+        json(res, 200, { sessionId: params.id, messages: projectMessages(events), hasMore })
+      },
+    },
+    {
+      method: 'GET',
+      path: '/sessions/:id/stream',
+      handler: async (req, res, params, _body, query) => {
+        // EventSource resume semantics: the Last-Event-ID header carries the
+        // last seen seq; an explicit afterSeq query parameter overrides it.
+        const lastEventId = Number(req.headers['last-event-id'])
+        const afterRaw = query.get('afterSeq')
+        const afterSeq = afterRaw !== null && afterRaw !== ''
+          ? Number(afterRaw)
+          : Number.isInteger(lastEventId) && lastEventId >= 0
+            ? lastEventId
+            : undefined
+        if (afterSeq !== undefined && (!Number.isInteger(afterSeq) || afterSeq < 0)) {
+          throw new HttpError(400, 'gateway/bad-request', 'query.afterSeq must be a non-negative integer')
+        }
+        const deltas = query.get('deltas') !== 'false'
+        await streamSession(req, res, params.id!, afterSeq, deltas)
+      },
+    },
+    {
+      method: 'POST',
+      path: '/projects/:id/sessions',
+      async handler(_req, res, params, body) {
+        const workspace = workspaceRegistry.get(asWorkspaceId(params.id!))
+        if (workspace === undefined) throw new HttpError(404, 'workspace/not-found', `project "${params.id}" not found`)
+        const { sessionId: named, agentPreset, title } = (body ?? {}) as {
+          sessionId?: unknown
+          agentPreset?: unknown
+          title?: unknown
+        }
+        const created = await sessionController.create({
+          workspaceId: asWorkspaceId(workspace.id),
+          ...(typeof named === 'string' ? { sessionId: asSessionId(named) } : {}),
+          ...(typeof agentPreset === 'string' ? { agentPreset } : {}),
+        })
+        if (typeof title === 'string' && title.length > 0) {
+          await sessionController.rename({ sessionId: asSessionId(created.sessionId), title })
+        }
+        json(res, 201, { sessionId: created.sessionId, agentPreset: created.agentPreset, projectId: workspace.id })
+      },
+    },
+    {
+      method: 'POST',
+      path: '/sessions/:id/messages',
+      async handler(_req, res, params, body) {
+        const sessionId = params.id!
+        const { text, mode, wait, timeoutMs, model, reasoningEffort, clientTimeZone } = (body ?? {}) as {
+          text?: unknown
+          mode?: unknown
+          wait?: unknown
+          timeoutMs?: unknown
+          model?: unknown
+          reasoningEffort?: unknown
+          clientTimeZone?: unknown
+        }
+        if (typeof text !== 'string' || text.length === 0) {
+          throw new HttpError(400, 'gateway/bad-request', 'body.text (non-empty string) is required; "/skill-name args" invokes a user-invocable skill')
+        }
+        if (mode !== undefined && mode !== 'queue' && mode !== 'steer') {
+          throw new HttpError(400, 'gateway/bad-request', 'body.mode must be "queue" or "steer"')
+        }
+        if (typeof model === 'string') {
+          await sessionController.selectModel({
+            sessionId: asSessionId(sessionId),
+            provider: model,
+            model,
+            ...(typeof reasoningEffort === 'string' ? { reasoningEffort: asReasoningEffort(reasoningEffort) } : {}),
+          })
+        }
+        const requestId = randomUUID()
+        await sessionController.prompt({
+          requestId: asSessionRequestId(requestId),
+          sessionId: asSessionId(sessionId),
+          mode: mode ?? 'queue',
+          content: [{ type: 'text', text }],
+          ...(typeof clientTimeZone === 'string' ? { clientTimeZone } : {}),
+        }, NEVER_ABORT)
+        if (wait === true) {
+          const value = await sessionController.wait({
+            sessionId: asSessionId(sessionId),
+            timeoutMs: typeof timeoutMs === 'number' && timeoutMs > 0 ? timeoutMs : 120_000,
+          }, NEVER_ABORT)
+          const outputText = value.output.records
+            .map((record) => assistantText((record as { event?: { type?: string; data?: unknown } }).event))
+            .filter((text): text is string => text !== undefined)
+            .join('\n')
+          json(res, 200, { accepted: true, requestId, wait: { reason: value.reason, state: value.state, outputText } })
+          return
+        }
+        json(res, 202, { accepted: true, requestId })
+      },
+    },
+    {
+      method: 'POST',
+      path: '/sessions/:id/open',
+      async handler(_req, res, params) {
+        const sessionId = params.id!
+        // Unknown sessions throw RemoteError('session/not-found') → mapped to 404.
+        await sessionController.state({ sessionId: asSessionId(sessionId) }, NEVER_ABORT)
+        const requestId = randomUUID()
+        const delivered = deps.remotes.broadcast({
+          type: 'open-session',
+          sessionId,
+          requestId,
+          time: Date.now(),
+        })
+        json(res, 202, { sessionId, accepted: true, delivered: delivered > 0, requestId })
+      },
+    },
+    {
+      method: 'POST',
+      path: '/sessions/:id/cancel',
+      async handler(_req, res, params) {
+        const value = sessionController.cancel({ sessionId: asSessionId(params.id!) })
+        json(res, 200, { accepted: value.accepted })
+      },
+    },
+    {
+      method: 'DELETE',
+      path: '/sessions/:id',
+      async handler(_req, res, params, _body, query) {
+        const sessionId = params.id!
+        const stop = query.get('stopActivity')
+        const stopActivity = stop === null ? false : stop !== 'false'
+        const owner = workspaceRegistry.list().find((workspace) => workspace.sessionIds.includes(asSessionId(sessionId)))
+        if (owner === undefined) {
+          throw new HttpError(409, 'workspace/not-attached',
+            'only sessions attached to a project can be archived via the REST API; the WebUI can remove ungrouped sessions')
+        }
+        await workspaceRegistry.archiveSession(asSessionId(sessionId), { stopActivity })
+        json(res, 200, { archived: true, projectId: owner.id })
+      },
+    },
+    {
+      method: 'GET',
+      path: '/sessions/:id/skills',
+      async handler(_req, res, params) {
+        const value = await deps.sessionSkillCatalog.list({ sessionId: asSessionId(params.id!) }, NEVER_ABORT)
+        json(res, 200, { sessionId: params.id, items: value.skills })
+      },
+    },
+  ]
+}
