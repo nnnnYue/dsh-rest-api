@@ -4,9 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-A standard RESTful API for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness)'s `dsh web`: model configuration, projects, sessions (async / SSE streaming / skill invocation), tool-call approvals, and skill management.
-
-The REST API runs in the **same dsh process and on the same data** as the official WebUI: projects / sessions / messages created over REST appear live in the WebUI at [http://127.0.0.1:3080](http://127.0.0.1:3080), and vice versa.
+A REST API for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness)'s `dsh web`. It manages models, projects, sessions, tool approvals, and skills. The API and the web UI share one process and one data set. Projects, sessions, and messages created over REST appear live in the web UI at [http://127.0.0.1:3080](http://127.0.0.1:3080), and the other way around.
 
 ## Contents
 
@@ -24,48 +22,47 @@ The REST API runs in the **same dsh process and on the same data** as the offici
 
 | Resource | Capabilities |
 |---|---|
-| **Models** `/models` | Live provider/model catalog + default model |
-| | CRUD for custom OpenAI-compatible providers (written to settings, hot-reloaded, synced with the WebUI settings page) |
-| | API key credential management (`POST /credentials`, responses are masked) |
-| **Projects** `/projects` | Directory registration (idempotent by canonical path), rename, delete, session ledger |
-| **Sessions** `/projects/:id/sessions` | Create (cwd = project directory, optionally pinning model and reasoning effort), list, status, rename |
-| | `POST /sessions/:id/messages` async send (202) or `wait=true` to block until the turn ends; carries optional provider/model/reasoningEffort to switch the session model first |
-| | Message text accepts `/skill-name args` to invoke user-invocable skills visible to the session |
-| | `POST /sessions/:id/cancel` to stop, `DELETE` to archive |
-| | `POST /sessions/:id/open` pushes the session to the foreground of online WebUI tabs |
-| | `GET /sessions/:id/stream` **SSE**: durable event replay + live assistant deltas, `Last-Event-ID` resumption |
-| | `GET /sessions/:id/messages` message projection (user/assistant with text/reasoning/tool parts and tool run state) |
-| **Global stream** `GET /stream` | Live-only SSE fan-out across all sessions (payloads carry `sessionId`) |
-| **Approvals** `/approvals` | Tool-call approvals: pending list + respond (allow / reject) |
-| **Skills** `/skills` | Catalog (source layer / invocation policy), create (user / project layer), update, toggle auto-invocation, delete |
+| **Models** `/models` | List the model catalog and the default model |
+| | Manage custom OpenAI-compatible providers, synced with the web settings page and applied immediately |
+| | Manage API keys, with masked responses |
+| **Projects** `/projects` | Register directories, rename, delete, list sessions; duplicate registration is ignored |
+| **Sessions** `/projects/:id/sessions` | Create, list, check status, rename, stop, archive; the project directory becomes the working directory |
+| | Send messages asynchronously, or add `wait=true` to wait for the turn; set the model and effort |
+| | Use `/skill-name args` to invoke a skill available to the session |
+| | Open the session in the web UI, optionally on a panel, and wait for a browser receipt |
+| | Stream saved events and live output over SSE, with resume after a disconnect |
+| | Read the assembled message history, including text, reasoning, tool calls, and run state |
+| **Global stream** `/stream` | One SSE connection for live events from all sessions |
+| **Approvals** `/approvals` | List pending tool calls, allow or reject |
+| **Skills** `/skills` | List, create, update, toggle auto-invocation, delete |
 
-Errors are uniformly `{"error": {"code": "...", "message": "..."}}`, with codes following dsh's `<domain>/<reason>` style (e.g. `session/not-found`). A machine-readable OpenAPI 3.1 description is served at `GET /rest/v1/openapi.json`.
+Errors are always `{"error": {"code": "...", "message": "..."}}`, with codes like `session/not-found`. The full API description is at `GET /rest/v1/openapi.json`.
 
 ## Install
 
-### Option 1: install as a profile plugin (recommended)
+### Option 1: install as a profile plugin
 
 ```sh
-dsh plugin --profile web add dsh-rest-api   # npm package / tgz / local directory all work
+dsh plugin --profile web add dsh-rest-api
 dsh web
 ```
 
-### Option 2: dev mode via --patch (hot-load without installing)
+### Option 2: dev mode
 
 ```sh
 npm install && npm run build
-# After editing the absolute paths in dev.patch.yml:
+# Edit the absolute paths in dev.patch.yml
 npx @deepseek-ai/dsh@next web --patch ./dev.patch.yml --port 3080 --no-open
 ```
 
-> Requires the `web` profile (provides webServer). The plugin declares injections for `webServer / sessionController / workspaceRegistry / llm / agentDefaultModel / credentials / skills / sessionSkillCatalog / settingsController / settings`; it will not load on a profile missing any of these services.
+> Requires the `web` profile and dsh's built-in web server, session, workspace, model, credential, and skill services.
 
 ## Auth
 
-- With `apiKey` configured: every request needs `Authorization: Bearer <apiKey>` (except `/health` and `/openapi.json`).
-- Without it: **loopback-only access** (fail closed).
+- With `apiKey` set, requests need `Authorization: Bearer <apiKey>`. The exceptions are `/health`, `/openapi.json`, and the browser receipt endpoint, which uses a one-time key.
+- Without `apiKey`, only local access is allowed.
 
-Injecting the token via an environment variable is recommended:
+Passing the token through an environment variable is convenient:
 
 ```yaml
 # ~/.dsh/cordis.patch.yml
@@ -91,19 +88,19 @@ curl -sX POST $B/projects -H 'content-type: application/json' \
   -d '{"path": "/repo/my-project", "title": "My Project"}'
 PID=<project id>
 
-# 2. Create a session (the project directory becomes the session cwd; optional provider / model / reasoningEffort pin its model and thinking level)
+# 2. Create a session; the project directory is the working directory
 curl -sX POST $B/projects/$PID/sessions -H 'content-type: application/json' \
   -d '{"title": "REST session"}'
 SID=<session id>
 
-# 3. Send a message asynchronously (returns 202 + requestId immediately)
+# 3. Send a message asynchronously
 curl -sX POST $B/sessions/$SID/messages -H 'content-type: application/json' \
   -d '{"text": "Summarize the package structure of this repo"}'
 
-# 4. Subscribe via SSE (durable events + live deltas, auto-resume on reconnect)
+# 4. Subscribe over SSE
 curl -sN $B/sessions/$SID/stream
 
-# 5. Invoke a skill (slash form triggers a user-invocable skill)
+# 5. Invoke a skill
 curl -sX POST $B/sessions/$SID/messages -H 'content-type: application/json' \
   -d '{"text": "/my-skill some args"}'
 
@@ -113,36 +110,47 @@ curl -sX POST $B/sessions/$SID/cancel
 
 A full end-to-end script is available at [`examples/demo.sh`](./examples/demo.sh).
 
-### SSE event model
+### SSE events
 
 `GET /rest/v1/sessions/:id/stream?afterSeq=N&deltas=true`
 
-- `event: session` — durable session events (`{type, seq, time, data}`); the SSE `id` is `seq`
-- `event: delta` — live assistant stream deltas (`agent/assistant-stream` frames: `text-delta` / `reasoning-delta` / `tool-call-delta` / `usage` / …); transient frames carry no id
-- 15s heartbeat comments; on reconnect, `Last-Event-ID` or `?afterSeq=` resumes from the last received event with no gaps
-- History is also available via paginated `GET /sessions/:id/events?afterSeq=&limit=`, or as projected message views via `GET /sessions/:id/messages`
+- `event: session`: a saved event; the SSE `id` is `seq`.
+- `event: delta`: live assistant output without an id.
+- A heartbeat is sent every 15 seconds. On reconnect, pass `Last-Event-ID` or `?afterSeq=` to resume.
+- Read history with paginated `GET /sessions/:id/events`, or use `GET /sessions/:id/messages` for assembled messages.
 
-The global stream `GET /rest/v1/stream?deltas=true` uses the same frame types, but payloads additionally carry `sessionId`, it covers **all** sessions, and it is live-only: no replay, no `Last-Event-ID` resumption; after a disconnect the client reconciles via paginated REST reads.
+The global stream `GET /rest/v1/stream` uses the same format, with a `sessionId` on each event. It covers all sessions and sends live events only. After a disconnect, the client catches up with paginated REST reads.
 
-### Pushing a session to the WebUI foreground
+### Opening a session in the web UI
+
+A web UI opened with `?dshTarget=<key>` responds only to requests for that target or `"*"`.
 
 ```sh
-curl -si -X POST $B/sessions/$SID/open
-# => HTTP/1.1 202 Accepted
-#    {"sessionId":"…","accepted":true,"delivered":true,"requestId":"…"}
+# Open on a specific panel; wait=true waits for the browser receipt
+curl -si -X POST $B/sessions/$SID/open -H 'content-type: application/json' \
+  -d '{"target":"panel-7f3a","wait":true}'
+# => HTTP/1.1 200 OK
+#    {"sessionId":"…","requestId":"…","mode":"targeted","target":"panel-7f3a","opened":true,"ackedBy":[…]}
+
+# Broadcast to every panel
+curl -sX POST $B/sessions/$SID/open -H 'content-type: application/json' -d '{"target":"*"}'
+
+# With one panel online, target can be omitted; with several, it returns 409
+curl -sX POST $B/sessions/$SID/open
 ```
 
-- `202` means "delivered, switch not confirmed" — the actual opening happens in the browser.
-- `delivered` indicates whether at least one subscribed WebUI tab existed at push time; `false` = no tab is online, the request is accepted but nobody will see it.
-- All online tabs receive the push and switch independently; pushes are live-only — no caching, no replay.
-- Implementation relies on the plugin's WebUI client module (injected via `dsh.client`): the module subscribes to the `restApi/open-requests` stream and calls `uiWorkspace.openSession` on each frame.
+- `202 + opened:false` means the request was accepted but not confirmed. `reason` is `no-client`, `timeout`, or `client-error`.
+- Without a target, the response includes `delivered`, which only says a subscription existed at push time. Check `opened` or `ackedBy`, or query `GET /open-requests/:requestId`, for confirmation.
+- After opening the session, the browser calls the receipt endpoint, which is checked with a one-time key.
+- `openPolicy: broadcast` restores the old broadcast-to-all behavior. The default `auto` returns 409 when several panels are online and no target is given.
+- Reload every web UI tab after upgrading the plugin.
 
-### Tool-call approvals
+### Tool approvals
 
-When a tool call inside a session triggers a dsh approval (`ask` policy, sandbox escalation, etc.), the request is taken over and held by this plugin until a REST client responds:
+When a tool call triggers a dsh approval, the plugin takes over the request and pauses it until a REST client responds:
 
 ```sh
-# Poll pending approvals (or watch for approval events on /stream)
+# List pending approvals
 curl -s $B/approvals
 # => {"items":[{"id":"…","sessionId":"…","toolName":"bash","callId":"…","reason":"…","askedAt":1700000000000}]}
 
@@ -150,17 +158,17 @@ curl -sX POST $B/approvals/<id>/respond -H 'content-type: application/json' \
   -d '{"outcome": "allowed-once"}'   # or "rejected"
 ```
 
-- Once registered as the approval answerer, the plugin **takes over all approvals**: other answerers (such as the WebUI dialog) no longer receive asks — REST is the only response channel.
-- Unanswered requests settle as `cancelled` after 15 minutes; the same applies when the tool call is cancelled / aborted (fail closed).
+- The plugin handles all approvals; the web UI dialog and other responders no longer receive requests.
+- An unanswered request is settled as `cancelled` after 15 minutes. The same happens when the tool call is cancelled or aborted.
 
 ### Model configuration
 
 ```sh
-# Store an API key (ref name = env-var-name style)
+# Save an API key
 curl -sX POST $B/credentials -H 'content-type: application/json' \
   -d '{"ref": "MY_GATEWAY_KEY", "value": "sk-..."}'
 
-# Register a custom OpenAI-compatible provider (written to settings, hot-reloaded)
+# Register a custom OpenAI-compatible provider
 curl -sX POST $B/models/providers -H 'content-type: application/json' -d '{
   "name": "my-gateway",
   "displayName": "My Gateway",
@@ -177,34 +185,33 @@ curl -sX PUT $B/models/default -H 'content-type: application/json' \
 
 ### Session-scoped model and reasoning effort
 
-A session's model and thinking level are session-private state; none of the entries below touch the global default model (only `PUT /models/default` does):
+A session's model and reasoning effort belong to that session only. None of the calls below change the global default model.
 
 ```sh
-# Pin at creation time (validated before the session is created; a rejected
-# selection leaves no empty session behind)
+# Set at creation
 curl -sX POST $B/projects/$PID/sessions -H 'content-type: application/json' \
   -d '{"model": "deepseek-v4-pro", "reasoningEffort": "max"}'
 
-# Change only the effort (model unchanged), or change the model (provider is
-# inferred when omitted; ambiguous across providers -> 400)
+# Change only the effort
+# Or change the model; provider is inferred when omitted, and the same model on several providers returns 400
 curl -sX PATCH $B/sessions/$SID -H 'content-type: application/json' -d '{"reasoningEffort": "low"}'
 curl -sX PATCH $B/sessions/$SID -H 'content-type: application/json' \
   -d '{"provider": "deepseek-official", "model": "deepseek-flash"}'
 
-# Read back the selection the session's next model step will use
+# Read back the session selection
 curl -s $B/sessions/$SID
 ```
 
-- Field shape matches dsh: `{provider, model, reasoningEffort?}`; omitted fields inherit the session's current selection, which starts as the global default.
-- Changes apply from the next model step; a running session can be switched at any time. `POST /sessions/:id/messages` also accepts the three fields to switch first.
-- `GET /models` reports each model's adapter-declared `reasoning.efforts` and `defaultEffort` (DeepSeek routes: `off | low | high | max`).
-- Validation failures return 400: `model/not-found` (route/model missing from the catalog), `model/ambiguous` (several providers offer the same model id; pass provider), `model/reasoning-effort-unsupported` (the message lists the supported efforts).
-- An effort-only change also pins the then-current default model onto the session (a dsh model selection is always the complete triple).
+- The fields are `{provider, model, reasoningEffort?}`. Omitted fields keep the session's current values.
+- Changes take effect from the next model call, and a running session can be switched at any time.
+- `GET /models` returns the reasoning efforts each model supports.
+- Validation failures return 400: `model/not-found`, `model/ambiguous`, `model/reasoning-effort-unsupported`.
+- Changing only `reasoningEffort` also pins the current default model to that session.
 
 ### Skill management
 
 ```sh
-# Create (defaults to the user layer ~/.dsh/skills/<name>/SKILL.md; layer=project requires cwd)
+# Create a skill; it defaults to the user layer
 curl -sX POST $B/skills -H 'content-type: application/json' -d '{
   "name": "deploy-check",
   "description": "Check deployment status and summarize",
@@ -213,15 +220,15 @@ curl -sX POST $B/skills -H 'content-type: application/json' -d '{
   "layer": "user"
 }'
 
-# Disable model auto-invocation (manual /deploy-check still works)
+# Disable model auto-invocation; manual /deploy-check still works
 curl -sX PATCH $B/skills/deploy-check -H 'content-type: application/json' \
   -d '{"modelInvocable": false}'
 
-# User-invocable skills visible to a session
+# List the skills a session can use
 curl -sX $B/sessions/<sid>/skills
 ```
 
-New files are picked up automatically by the skill-filesystem watcher (`skills/change`) — no restart needed; skills from bundled / runtime sources are read-only (409).
+New files are discovered automatically, with no restart. Built-in and runtime skills are read-only, and edits return 409.
 
 ## API reference
 
@@ -236,6 +243,7 @@ GET/PATCH /rest/v1/sessions/:id               DELETE /rest/v1/sessions/:id[?stop
 GET    /rest/v1/sessions/:id/events           GET    /rest/v1/sessions/:id/messages
 POST   /rest/v1/sessions/:id/messages         POST   /rest/v1/sessions/:id/cancel
 POST   /rest/v1/sessions/:id/open
+POST   /rest/v1/open-requests/:requestId/ack  GET    /rest/v1/open-requests/:requestId
 GET    /rest/v1/sessions/:id/stream (SSE)     GET    /rest/v1/stream (SSE, all sessions)
 GET    /rest/v1/approvals                     POST   /rest/v1/approvals/:id/respond
 GET    /rest/v1/sessions/:id/skills           GET/POST /rest/v1/skills
@@ -246,26 +254,26 @@ GET/PATCH/DELETE /rest/v1/skills/:name[?cwd=]
 
 | Field | Default | Description |
 |---|---|---|
-| `apiKey` | `null` | Bearer token; `null` = loopback only |
-| `prefix` | `/rest/v1` | Route prefix (absolute path) |
+| `apiKey` | `null` | Bearer token; `null` means local access only |
+| `prefix` | `/rest/v1` | Route prefix |
+| `openPolicy` | `auto` | Behavior without a target: `auto` returns 409 with several panels; `broadcast` pushes to all panels |
 
 ## Design notes
 
-- Same-process sync with the WebUI: all session / project operations go through official in-process services such as `sessionController` / `workspaceRegistry`; the WebUI refreshes via its own observe streams — no extra event bridge.
-- SSE deltas come from global subscriptions (`{global: true}`, matching dsh's own session-controller approach) to `session/event` (durable) and `agent/assistant-stream` (transient); the subscription is established before replay with watermark dedup, guaranteeing a seamless join.
-- Custom providers are written via `settingsController.mutate` into the llm gateway plugin's volatile `providers` config (persisted in the profile patch + hot-reloaded by the Loader) — the same write path as the WebUI settings page.
-- Approvals are exposed as an in-process answerer for `approval/request` waterfall events: claimed, then held until a REST response arrives; ids are plugin-signed (waterfall events carry no service id), while auditing still lands as paired durable `approval/asked` / `approval/decided` events.
-- The message projection (`GET /sessions/:id/messages`) is a pure fold over durable events: a `tool/call` with no matching `tool/result` is `running`; `tool/result.isError` or an event-level `error` is `error`.
-- Session files follow a single-writer model: the plugin only touches sessions through official APIs and never opens JSONL / Zstd logs directly.
-- Session-scoped model selection goes through `resolveAgent` + `agent.model.select()` (the same path the host's ACP transport takes): validate via `llm.listModels` / `llm.resolveCallConfig`, then append a `model/selection` event to the session log. `sessionController.selectModel` is deliberately avoided because it also overwrites the global default model.
-- The "open session" push does not forward events via `ctx.remote.$on` (only one forward source per Host, owned by `dsh-api-remotes`); instead the plugin serves its own SRC Remote stream `restApi/open-requests`, auto-exposed server-side via Typert Gateway SRC reflection and subscribed manually by the WebUI client module's stream contribution.
+- Every operation goes through dsh's own services, and the web UI refreshes automatically.
+- Live events are subscribed before history is replayed, so a reconnect loses nothing.
+- Custom providers are written through the same path as the web settings page.
+- Approvals are handled by the plugin and end automatically on timeout or cancellation.
+- The plugin only uses dsh's official interfaces and never reads or writes session files directly.
 
 ## Known limitations
 
-- Verified against the npm release of dsh (0.2.2-rc.x); the webServer `auth` field newly added on master is handled for compatibility.
-- Sessions not attached to a project cannot be archived over REST (409 with a hint).
-- Output text for `wait=true` is extracted from the durable event stream; very long output may be truncated (a `truncated` flag is present in state).
-- dsh has no message-delete semantics, so projected message views contain no deletion events (compaction's `surfaceOp` replace is handled).
+- Verified on the npm release of dsh 0.2.2-rc.x.
+- Sessions not attached to a project cannot be archived over REST and return 409.
+- The output for `wait=true` comes from saved events and may be truncated when very long.
+- The message list contains no deletion events because dsh has no message deletion.
+- Panel targets only prevent UIs from taking over each other; they do not isolate data between users.
+- Open requests are sent live only; retry after a `wait=true` timeout.
 
 ## License
 
