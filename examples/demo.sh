@@ -80,8 +80,10 @@ curl -s "${AUTH[@]+${AUTH[@]}}" "$BASE/approvals"; echo
 curl -s "${AUTH[@]+${AUTH[@]}}" -X POST "$BASE/approvals/00000000-0000-0000-0000-000000000000/respond" \
   -H 'content-type: application/json' -d '{"outcome": "rejected"}'; echo
 
-echo "=== 13. open the session in online WebUI tabs (delivered=false when none) ==="
-curl -s "${AUTH[@]+${AUTH[@]}}" -X POST "$BASE/sessions/$SID/open"; echo
+echo "=== 13. open the session in a WebUI panel (reason=no-client when none) ==="
+# Open http://127.0.0.1:3080/?dshTarget=demo-panel first to see opened=true + ackedBy.
+curl -s "${AUTH[@]+${AUTH[@]}}" -X POST "$BASE/sessions/$SID/open" \
+  -H 'content-type: application/json' -d '{"target":"demo-panel","wait":true,"timeoutMs":1000}'; echo
 curl -s "${AUTH[@]+${AUTH[@]}}" -X POST "$BASE/sessions/00000000-0000-0000-0000-000000000000/open" \
   -o /dev/null -w 'unknown session -> HTTP %{http_code}\n'
 

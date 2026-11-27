@@ -50,7 +50,13 @@ export function writeError(res: ServerResponse, error: unknown): void {
 
 /** Send one JSON response and close the request. */
 export function json(res: ServerResponse, status: number, payload: unknown): void {
-  if (res.writableEnded) return
+  // A long-poll route can outlive its client; never write to a closed socket.
+  if (res.writableEnded || res.destroyed) return
+  if (payload === undefined) {
+    res.writeHead(status)
+    res.end()
+    return
+  }
   const body = JSON.stringify(payload)
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',

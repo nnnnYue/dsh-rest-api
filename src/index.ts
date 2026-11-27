@@ -4,6 +4,7 @@ import { guard } from './auth.ts'
 import { json } from './errors.ts'
 import { createDispatcher, type RouteSpec } from './http.ts'
 import { openapiDocument } from './openapi.ts'
+import { OpenRequestRegistry } from './open-requests.ts'
 import { RestApiRemotes } from './remotes.ts'
 import { EventHub } from './sse.ts'
 import { ApprovalRegistry, approvalRoutes, registerApprovalAnswerer } from './routes/approvals.ts'
@@ -35,6 +36,8 @@ export function apply(ctx: Context, config: RestApiConfig): void {
   // The Gateway discovers this SRC Remote service through shared reflect props
   // and re-scans on every `internal/service` event, so late registration is fine.
   const remotes = new RestApiRemotes(ctx)
+  const openRequests = new OpenRequestRegistry()
+  ctx.effect(() => () => openRequests.dispose(), 'dsh-rest-api: open-request ledger')
 
   const deps: Deps = {
     ctx,
@@ -50,6 +53,7 @@ export function apply(ctx: Context, config: RestApiConfig): void {
     settingsController: ctx.settingsController,
     settings: ctx.settings,
     remotes,
+    openRequests,
   }
 
   // Bridge the harness event feed to per-connection SSE writers. Cordis

@@ -8,16 +8,28 @@ export interface OpenSessionFrame {
   readonly type: 'open-session'
   readonly sessionId: string
   readonly requestId: string
+  /**
+   * Panel routing key. `'*'` reaches every tab; a concrete key reaches only
+   * tabs opened with the matching `?dshTarget=` value. The field is omitted
+   * only by pre-0.2 hosts, which the client treats as legacy broadcast.
+   */
+  readonly target?: string
   readonly time: number
+  /** Browser callback endpoint for the commit acknowledgement. */
+  readonly ack: {
+    readonly url: string
+    readonly key: string
+  }
 }
 
 /**
  * SRC-mode Remote service exposing the `restApi/open-requests` stream. The
  * plugin's WebUI client module (`lib/client.js`) mounts a zero-parameter
- * contribution for this endpoint and calls `uiWorkspace.openSession` for every
- * frame. Delivery is live-only: frames are never buffered for tabs that are
- * not currently subscribed, so REST callers see `delivered` reflect the
- * subscription count at push time.
+ * contribution for this endpoint, filters frames by its panel target, and
+ * calls `uiWorkspace.openSession` only for accepted frames. Delivery is
+ * live-only: frames are never buffered for tabs that are not currently
+ * subscribed, so `delivered` reflects the subscription count at push time and
+ * `wait=true` acknowledgements are the confirmation signal.
  */
 export class RestApiRemotes extends TypertRemoteService {
   private readonly streams = new Set<FrameQueue<OpenSessionFrame>>()
@@ -51,6 +63,11 @@ export class RestApiRemotes extends TypertRemoteService {
    */
   broadcast(frame: OpenSessionFrame): number {
     for (const queue of this.streams) queue.push(frame)
+    return this.streams.size
+  }
+
+  /** Number of currently subscribed WebUI streams. */
+  subscriberCount(): number {
     return this.streams.size
   }
 }

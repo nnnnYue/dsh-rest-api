@@ -8,7 +8,7 @@ export function openapiDocument(config: RestApiConfig): Record<string, unknown> 
     openapi: '3.1.0',
     info: {
       title: 'DeepSeek Harness REST API',
-      version: '0.1.0',
+      version: '0.2.0',
       description: 'RESTful control surface provided by the dsh-rest-api plugin. All non-public endpoints accept `Authorization: Bearer <apiKey>`; without a configured apiKey only loopback callers are admitted.',
     },
     servers: [{ url: p }],
@@ -156,10 +156,46 @@ export function openapiDocument(config: RestApiConfig): Record<string, unknown> 
       },
       '/sessions/{id}/open': {
         post: {
-          summary: 'Ask every online WebUI tab to switch its main view to this session (202 = delivered to the push stream; delivered=false means no tab is subscribed)',
+          summary: 'Route this session to a WebUI panel. Pass body.target (the panel ?dshTarget key) to switch only that panel, target="*" to broadcast, or omit target when a single panel is online. wait=true blocks until a matching panel acknowledges the switch.',
           operationId: 'openSession',
           parameters: [idParam],
-          responses: { '202': { description: 'Accepted (fire-and-forget; the UI switch is not awaited)' }, '404': ref('') },
+          requestBody: { content: { 'application/json': { schema: { type: 'object', properties: {
+            target: { type: 'string', description: 'Panel routing key; "*" broadcasts to every panel; omit for the single-online-panel case' },
+            wait: { type: 'boolean', default: false, description: 'Wait for the first successful browser acknowledgement' },
+            timeoutMs: { type: 'integer', minimum: 1, maximum: 30000, default: 5000, description: 'Only with wait=true' },
+          } } } } },
+          responses: {
+            '200': { description: 'opened=true (wait=true and a panel acknowledged)' },
+            '202': { description: 'Accepted but not confirmed; opened=false with reason=no-client|timeout|client-error' },
+            '400': ref(''),
+            '404': ref(''),
+            '409': ref(''),
+          },
+        },
+      },
+      '/open-requests/{requestId}/ack': {
+        post: {
+          summary: 'Browser callback acknowledging one open request (Bearer-exempt when apiKey is configured, loopback-only otherwise; authenticated by the one-time key carried in the push frame)',
+          operationId: 'ackOpenRequest',
+          security: [],
+          parameters: [requestIdParam],
+          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['key', 'clientId', 'sessionId', 'ok'], properties: {
+            key: { type: 'string' },
+            clientId: { type: 'string' },
+            target: { type: 'string' },
+            sessionId: { type: 'string' },
+            ok: { type: 'boolean' },
+            error: { type: 'string' },
+          } } } } },
+          responses: { '204': { description: 'Acknowledged' }, '400': ref(''), '404': ref(''), '409': ref('') },
+        },
+      },
+      '/open-requests/{requestId}': {
+        get: {
+          summary: 'Open-request state and acknowledgements (kept for 60s; target is the caller-supplied panel key, when present)',
+          operationId: 'getOpenRequest',
+          parameters: [requestIdParam],
+          responses: { '200': { description: 'OK' }, '404': ref('') },
         },
       },
       '/sessions/{id}/stream': {
@@ -248,3 +284,4 @@ export function openapiDocument(config: RestApiConfig): Record<string, unknown> 
 const idParam = { name: 'id', in: 'path', required: true, schema: { type: 'string' } }
 const nameParam = { name: 'name', in: 'path', required: true, schema: { type: 'string' } }
 const refParam = { name: 'ref', in: 'path', required: true, schema: { type: 'string' } }
+const requestIdParam = { name: 'requestId', in: 'path', required: true, schema: { type: 'string' } }

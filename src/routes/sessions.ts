@@ -15,12 +15,25 @@ import {
 } from '../model-selection.ts'
 import { SseWriter, type EventHub } from '../sse.ts'
 import { projectMessages } from '../projection.ts'
+import { DEFAULT_OPEN_WAIT_MS, MAX_OPEN_WAIT_MS } from '../open-requests.ts'
 import type { Deps } from '../types.ts'
 
 const REPLAY_PAGE_MESSAGES = 400
 const REPLAY_MAX_PAGES = 200
 const DEFAULT_EVENT_LIMIT = 1000
 const MAX_EVENT_LIMIT = 10_000
+const MAX_OPEN_TARGET_LENGTH = 128
+
+/** Validate the optional panel routing key carried by an open request. */
+function openTarget(value: unknown): string | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'string' || value.length === 0 || value.length > MAX_OPEN_TARGET_LENGTH
+    || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new HttpError(400, 'gateway/bad-request',
+      `body.target must be a non-empty string of at most ${MAX_OPEN_TARGET_LENGTH} printable characters`)
+  }
+  return value
+}
 
 interface WireEvent {
   readonly type: string
@@ -343,18 +356,179 @@ export function sessionRoutes(deps: Deps, hub: EventHub): RouteSpec[] {
     {
       method: 'POST',
       path: '/sessions/:id/open',
-      async handler(_req, res, params) {
+      async handler(_req, res, params, body) {
         const sessionId = params.id!
+        const payload = (body ?? {}) as {
+          target?: unknown
+          wait?: unknown
+          timeoutMs?: unknown
+        }
+        const target = openTarget(payload.target)
+        if (payload.wait !== undefined && typeof payload.wait !== 'boolean') {
+          throw new HttpError(400, 'gateway/bad-request', 'body.wait must be a boolean')
+        }
+        const timeoutRaw = payload.timeoutMs
+        if (timeoutRaw !== undefined && (typeof timeoutRaw !== 'number' || !Number.isInteger(timeoutRaw)
+          || timeoutRaw < 1 || timeoutRaw > MAX_OPEN_WAIT_MS)) {
+          throw new HttpError(400, 'gateway/bad-request',
+            `body.timeoutMs must be an integer in [1, ${MAX_OPEN_WAIT_MS}]`)
+        }
+        const wait = payload.wait === true
+        const timeoutMs = typeof timeoutRaw === 'number' ? timeoutRaw : DEFAULT_OPEN_WAIT_MS
         // Unknown sessions throw RemoteError('session/not-found') → mapped to 404.
         await sessionController.state({ sessionId: asSessionId(sessionId) }, NEVER_ABORT)
-        const requestId = randomUUID()
-        const delivered = deps.remotes.broadcast({
+        if (workspaceRegistry.archivedSessionIds.includes(asSessionId(sessionId))) {
+          throw new HttpError(409, 'session/archived',
+            `session "${sessionId}" is archived; unarchive it in the WebUI first`)
+        }
+        const subscribers = deps.remotes.subscriberCount()
+        const policy = deps.config.openPolicy
+        if (target === undefined && policy === 'auto' && subscribers > 1) {
+          throw new HttpError(409, 'open/target-required',
+            `${subscribers} WebUI streams are connected; pass body.target (the panel ?dshTarget key) or body.target="*" to broadcast`)
+        }
+        const mode = target === '*' ? 'broadcast' : target !== undefined ? 'targeted' : policy === 'broadcast' ? 'broadcast' : 'single'
+        const targetField = target !== undefined ? { target } : {}
+        if (subscribers === 0) {
+          json(res, 202, {
+            sessionId,
+            accepted: true,
+            mode,
+            ...targetField,
+            subscribers: 0,
+            delivered: false,
+            opened: false,
+            reason: 'no-client',
+          })
+          return
+        }
+        const { requestId, ackKey } = deps.openRequests.create({
+          sessionId,
+          ...(target !== undefined ? { target } : {}),
+        })
+        // A no-target request is safe only because the policy above admitted
+        // it; `'*'` also lets an explicitly targeted single panel accept it.
+        const frameTarget = target ?? '*'
+        deps.remotes.broadcast({
           type: 'open-session',
           sessionId,
           requestId,
+          target: frameTarget,
           time: Date.now(),
+          ack: { url: `${deps.config.prefix}/open-requests/${requestId}/ack`, key: ackKey },
         })
-        json(res, 202, { sessionId, accepted: true, delivered: delivered > 0, requestId })
+        if (!wait) {
+          json(res, 202, {
+            sessionId,
+            requestId,
+            accepted: true,
+            mode,
+            ...targetField,
+            subscribers,
+            // A concrete target is only confirmed by a browser ack; do not
+            // claim delivery from the host-side subscriber count.
+            ...(target === undefined || target === '*' ? { delivered: true } : {}),
+          })
+          return
+        }
+        const abort = new AbortController()
+        const onClose = (): void => { if (!res.writableEnded) abort.abort() }
+        res.once('close', onClose)
+        const result = await deps.openRequests.wait(requestId, timeoutMs, abort.signal)
+        res.off('close', onClose)
+        if (abort.signal.aborted) return
+        if (result.opened) {
+          const snapshot = deps.openRequests.get(requestId)
+          json(res, 200, {
+            sessionId,
+            requestId,
+            mode,
+            ...targetField,
+            opened: true,
+            subscribers,
+            ackedBy: snapshot === undefined ? [] : snapshot.acks.filter((ack) => ack.ok),
+          })
+          return
+        }
+        json(res, 202, {
+          sessionId,
+          requestId,
+          mode,
+          ...targetField,
+          opened: false,
+          reason: result.reason ?? 'timeout',
+          ...(result.error !== undefined ? { error: result.error } : {}),
+          subscribers,
+        })
+      },
+    },
+    {
+      method: 'POST',
+      path: '/open-requests/:requestId/ack',
+      // Browser callback. With an apiKey configured the WebUI cannot carry the
+      // Bearer token, so the guard is skipped and the one-time frame key
+      // authenticates the request; without one the normal loopback fence stays.
+      public: deps.config.apiKey !== null,
+      async handler(_req, res, params, body) {
+        const { key, clientId, target, sessionId, ok, error } = (body ?? {}) as {
+          key?: unknown
+          clientId?: unknown
+          target?: unknown
+          sessionId?: unknown
+          ok?: unknown
+          error?: unknown
+        }
+        if (typeof key !== 'string' || key.length === 0) {
+          throw new HttpError(400, 'gateway/bad-request', 'body.key is required')
+        }
+        if (typeof clientId !== 'string' || clientId.length === 0) {
+          throw new HttpError(400, 'gateway/bad-request', 'body.clientId is required')
+        }
+        if (target !== undefined && typeof target !== 'string') {
+          throw new HttpError(400, 'gateway/bad-request', 'body.target must be a string when present')
+        }
+        if (typeof sessionId !== 'string' || sessionId.length === 0) {
+          throw new HttpError(400, 'gateway/bad-request', 'body.sessionId is required')
+        }
+        if (typeof ok !== 'boolean') {
+          throw new HttpError(400, 'gateway/bad-request', 'body.ok must be a boolean')
+        }
+        if (error !== undefined && typeof error !== 'string') {
+          throw new HttpError(400, 'gateway/bad-request', 'body.error must be a string when present')
+        }
+        const result = deps.openRequests.ack(params.requestId!, {
+          key,
+          clientId,
+          ...(target !== undefined ? { target } : {}),
+          sessionId,
+          ok,
+          ...(error !== undefined ? { error: error.slice(0, 500) } : {}),
+        })
+        if (result === 'not-found') {
+          throw new HttpError(404, 'open/request-not-found', `open request "${params.requestId}" not found or expired`)
+        }
+        if (result === 'key-mismatch') {
+          throw new HttpError(409, 'open/ack-key-mismatch', 'ack key does not match the open request')
+        }
+        if (result === 'target-mismatch') {
+          throw new HttpError(409, 'open/target-mismatch', 'ack target does not match the open request target')
+        }
+        if (result === 'session-mismatch') {
+          throw new HttpError(409, 'open/session-mismatch', 'ack sessionId does not match the open request session')
+        }
+        res.writeHead(204, { 'cache-control': 'no-store' })
+        res.end()
+      },
+    },
+    {
+      method: 'GET',
+      path: '/open-requests/:requestId',
+      async handler(_req, res, params) {
+        const snapshot = deps.openRequests.get(params.requestId!)
+        if (snapshot === undefined) {
+          throw new HttpError(404, 'open/request-not-found', `open request "${params.requestId}" not found or expired`)
+        }
+        json(res, 200, snapshot)
       },
     },
     {

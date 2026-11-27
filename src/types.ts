@@ -15,7 +15,11 @@ import type { SettingsController } from '@deepseek-ai/dsh-api-settings-controlle
 import type { SettingsForms } from '@deepseek-ai/dsh-settings'
 import type { SkillRegistry } from '@deepseek-ai/dsh-skill'
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
+import type { OpenRequestRegistry } from './open-requests.ts'
 import type { RestApiRemotes } from './remotes.ts'
+
+/** How an untargeted open request behaves when several WebUI panels are online. */
+export type OpenPolicy = 'auto' | 'broadcast'
 
 /** Resolved plugin configuration after schema validation. */
 export interface RestApiConfig {
@@ -23,6 +27,11 @@ export interface RestApiConfig {
   readonly apiKey: string | null
   /** Absolute pathname prefix (no trailing slash) that owns the REST surface. */
   readonly prefix: string
+  /**
+   * `auto` rejects an untargeted open when more than one panel is subscribed;
+   * `broadcast` keeps the pre-0.2 behaviour of switching every online panel.
+   */
+  readonly openPolicy: OpenPolicy
 }
 
 /** Minimal structural shape of a Standard Schema validator (schema.org/spec v1). */
@@ -67,8 +76,16 @@ export const ConfigSchema: ConfigSchemaLike<RestApiConfig> = {
           prefix = ('/' + raw.prefix.replace(/^\/+|\/+$/g, '')) || DEFAULT_PREFIX
         }
       }
+      let openPolicy: OpenPolicy = 'auto'
+      if (raw.openPolicy !== undefined && raw.openPolicy !== null) {
+        if (raw.openPolicy !== 'auto' && raw.openPolicy !== 'broadcast') {
+          issues.push({ message: 'config.openPolicy must be "auto" or "broadcast"' })
+        } else {
+          openPolicy = raw.openPolicy
+        }
+      }
       if (issues.length > 0) return { issues }
-      return { value: { apiKey, prefix } }
+      return { value: { apiKey, prefix, openPolicy } }
     },
   },
 }
@@ -93,6 +110,8 @@ export interface Deps {
   readonly settings: SettingsForms
   /** Plugin-owned push channel toward WebUI client modules. */
   readonly remotes: RestApiRemotes
+  /** Pending open-request ledger used for acknowledgements and status queries. */
+  readonly openRequests: OpenRequestRegistry
 }
 
 /** Route registration shape bridging published (0.2.2-rc.x) and master webserver. */
